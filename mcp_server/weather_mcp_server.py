@@ -1,505 +1,456 @@
 """
-Weather MCP server.
+Weather broker: HTTP adapter around Open-Meteo + NWS.
 
-Exposes weather forecast tools over MCP (Model Context Protocol) so a
-Databricks Agent Bricks agent can call them like any other tool:
+Same role as alpaca_broker.py in the reference project - all HTTP calls
+and response parsing live here so the MCP tool functions in
+weather_mcp_server.py can stay thin.
 
-Live weather (Open-Meteo, no auth):
-    - resolve_location(query) - Resolve a place name to lat/lon
-    - get_current_weather(location) - Current conditions
-    - get_daily_forecast(location, days) - Multi-day forecast
-    - get_hourly_forecast(location, hours) - Hourly forecast
-
-Severe weather (NWS, US-only, no auth):
-    - get_active_alerts(location) - Active NWS alerts
-
-Semantic search over stored weather documents (Day 2 pgvector layer):
-    - vector_search(query, limit) - Cosine-similarity search over
-      weather_documents/weather_embeddings
-
-User identity:
-    - get_current_user() - Get authenticated user info
-
-Tracing & Monitoring:
-    All tool calls are automatically traced to a Lakebase table
-    (mcp_tool_traces) with session ID, user email, parameters, results,
-    duration, and success status.
-
-Deploy this as its own Databricks App (see app.yaml), separate from the
-Day 2 Flask app.
-
-Run locally:
-    python weather_mcp_server.py
+Data sources (both free, no API key required):
+  - Open-Meteo (https://open-meteo.com/) - geocoding + global forecast data
+  - NWS (https://api.weather.gov/) - US-only active alerts
 """
 
-import inspect
-import json
-import logging
 import os
-import time
-import uuid
-from contextvars import ContextVar
-from functools import wraps
+from typing import Any
 
-from fastmcp import FastMCP
-from sentence_transformers import SentenceTransformer
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-
-import lakebase
-import weather_broker
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("weather-mcp-server")
+import requests
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-WEATHER_DOCS_TABLE = os.environ.get("WEATHER_DOCS_TABLE", "weather_documents")
-WEATHER_EMBEDDINGS_TABLE = os.environ.get("WEATHER_EMBEDDINGS_TABLE", "weather_embeddings")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+OPEN_METEO_BASE = "https://api.open-meteo.com/v1"
+OPEN_METEO_GEOCODE_BASE = "https://geocoding-api.open-meteo.com/v1"
+NWS_BASE = "https://api.weather.gov"
 
-# ---------------------------------------------------------------------------
-# Embedding model (lazy-loaded on first vector_search call)
-# ---------------------------------------------------------------------------
+# NWS requires a descriptive User-Agent. Override via env var when deploying.
+NWS_USER_AGENT = os.environ.get(
+    "NWS_USER_AGENT",
+    "weather-mcp-server (rajendrannpriyankaa@gmail.com)",
+)
 
-_embedding_model = None
+DEFAULT_TIMEOUT = 15
 
-
-def get_embedding_model():
-    """Lazy-load the embedding model (expensive; only on first use)."""
-    global _embedding_model
-    if _embedding_model is None:
-        logger.info(f"Loading embedding model: {EMBEDDING_MODEL}")
-        _embedding_model = SentenceTransformer(EMBEDDING_MODEL)
-    return _embedding_model
+# Reusable sessions - created lazily on first call.
+_open_meteo_session: requests.Session | None = None
+_nws_session: requests.Session | None = None
 
 
-# ---------------------------------------------------------------------------
-# Request context (captured from HTTP headers by middleware)
-# ---------------------------------------------------------------------------
+def _get_open_meteo_session() -> requests.Session:
+    global _open_meteo_session
+    if _open_meteo_session is None:
+        _open_meteo_session = requests.Session()
+    return _open_meteo_session
 
-_request_context: ContextVar[dict] = ContextVar('request_context', default={})
 
-
-def _get_end_user_email() -> str:
-    """Get the end user's email from request headers, else the service principal."""
-    headers = _request_context.get()
-    forwarded_user = headers.get('x-forwarded-user')
-    if forwarded_user:
-        return forwarded_user
-
-    from databricks.sdk import WorkspaceClient
-    w = WorkspaceClient()
-    return w.current_user.me().user_name or 'unknown@user'
+def _get_nws_session() -> requests.Session:
+    global _nws_session
+    if _nws_session is None:
+        _nws_session = requests.Session()
+        _nws_session.headers.update({
+            "User-Agent": NWS_USER_AGENT,
+            "Accept": "application/geo+json",
+        })
+    return _nws_session
 
 
 # ---------------------------------------------------------------------------
-# Session ID for grouping tool calls from this server instance
+# Geocoding
 # ---------------------------------------------------------------------------
 
-SESSION_ID = str(uuid.uuid4())
-logger.info(f"MCP Server Session ID: {SESSION_ID}")
+def geocode(location: str) -> dict[str, Any]:
+    """Resolve a location name to lat/lon + timezone via Open-Meteo."""
+    session = _get_open_meteo_session()
+    resp = session.get(
+        f"{OPEN_METEO_GEOCODE_BASE}/search",
+        params={"name": location, "count": 1, "language": "en", "format": "json"},
+        timeout=DEFAULT_TIMEOUT,
+    )
+    resp.raise_for_status()
+    results = resp.json().get("results") or []
+    if not results:
+        raise ValueError(f"No location found for query: {location!r}")
+    top = results[0]
+    return {
+        "query": location,
+        "name": top.get("name"),
+        "country": top.get("country"),
+        "admin1": top.get("admin1"),
+        "latitude": top.get("latitude"),
+        "longitude": top.get("longitude"),
+        "timezone": top.get("timezone"),
+    }
+
+
+def _short_name(geo: dict) -> str:
+    parts = [geo.get("name")]
+    if geo.get("admin1"):
+        parts.append(geo["admin1"])
+    elif geo.get("country"):
+        parts.append(geo["country"])
+    return ", ".join(p for p in parts if p)
 
 
 # ---------------------------------------------------------------------------
-# Trace logging to Lakebase
+# Current weather
 # ---------------------------------------------------------------------------
 
-# Flag so we only try to create the table once per server lifetime.
-# If it fails (e.g. ownership error), we assume the table already exists
-# and skip the DDL on subsequent calls.
-_traces_table_checked = False
+def get_current(location: str) -> dict[str, Any]:
+    """Current conditions at the given location (Open-Meteo)."""
+    geo = geocode(location)
+    session = _get_open_meteo_session()
+    resp = session.get(
+        f"{OPEN_METEO_BASE}/forecast",
+        params={
+            "latitude": geo["latitude"],
+            "longitude": geo["longitude"],
+            "current": ",".join([
+                "temperature_2m",
+                "relative_humidity_2m",
+                "apparent_temperature",
+                "precipitation",
+                "weather_code",
+                "wind_speed_10m",
+                "wind_direction_10m",
+                "cloud_cover",
+            ]),
+            "timezone": geo["timezone"] or "auto",
+            "temperature_unit": "fahrenheit",
+            "wind_speed_unit": "mph",
+            "precipitation_unit": "inch",
+        },
+        timeout=DEFAULT_TIMEOUT,
+    )
+    resp.raise_for_status()
+    current = resp.json().get("current", {})
+    return {
+        "location": _short_name(geo),
+        "latitude": geo["latitude"],
+        "longitude": geo["longitude"],
+        "observed_at": current.get("time"),
+        "temperature_f": current.get("temperature_2m"),
+        "feels_like_f": current.get("apparent_temperature"),
+        "humidity_pct": current.get("relative_humidity_2m"),
+        "precipitation_in": current.get("precipitation"),
+        "wind_mph": current.get("wind_speed_10m"),
+        "wind_direction_deg": current.get("wind_direction_10m"),
+        "cloud_cover_pct": current.get("cloud_cover"),
+        "conditions": _weather_code_to_text(current.get("weather_code")),
+    }
 
 
-def _ensure_traces_table():
-    """Idempotently ensure the traces table exists. Runs once per process."""
-    global _traces_table_checked
-    if _traces_table_checked:
-        return
-    _traces_table_checked = True
+# ---------------------------------------------------------------------------
+# Daily forecast
+# ---------------------------------------------------------------------------
 
+def get_daily_forecast(location: str, days: int = 3) -> dict[str, Any]:
+    """Daily forecast for the next N days (1-7)."""
+    days = max(1, min(7, int(days)))
+    geo = geocode(location)
+    session = _get_open_meteo_session()
+    resp = session.get(
+        f"{OPEN_METEO_BASE}/forecast",
+        params={
+            "latitude": geo["latitude"],
+            "longitude": geo["longitude"],
+            "daily": ",".join([
+                "temperature_2m_max",
+                "temperature_2m_min",
+                "precipitation_sum",
+                "precipitation_probability_max",
+                "weather_code",
+                "wind_speed_10m_max",
+                "sunrise",
+                "sunset",
+            ]),
+            "forecast_days": days,
+            "timezone": geo["timezone"] or "auto",
+            "temperature_unit": "fahrenheit",
+            "wind_speed_unit": "mph",
+            "precipitation_unit": "inch",
+        },
+        timeout=DEFAULT_TIMEOUT,
+    )
+    resp.raise_for_status()
+    daily = resp.json().get("daily", {})
+    dates = daily.get("time", [])
+    periods = []
+    for i, date in enumerate(dates):
+        periods.append({
+            "date": date,
+            "high_f": daily.get("temperature_2m_max", [None])[i],
+            "low_f": daily.get("temperature_2m_min", [None])[i],
+            "precipitation_in": daily.get("precipitation_sum", [None])[i],
+            "precipitation_chance_pct": daily.get("precipitation_probability_max", [None])[i],
+            "max_wind_mph": daily.get("wind_speed_10m_max", [None])[i],
+            "conditions": _weather_code_to_text(daily.get("weather_code", [None])[i]),
+            "sunrise": daily.get("sunrise", [None])[i],
+            "sunset": daily.get("sunset", [None])[i],
+        })
+    return {
+        "location": _short_name(geo),
+        "latitude": geo["latitude"],
+        "longitude": geo["longitude"],
+        "days": periods,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Hourly forecast
+# ---------------------------------------------------------------------------
+
+def get_hourly_forecast(location: str, hours: int = 24) -> dict[str, Any]:
+    """Hourly forecast for the next N hours (1-72)."""
+    hours = max(1, min(72, int(hours)))
+    geo = geocode(location)
+    session = _get_open_meteo_session()
+    resp = session.get(
+        f"{OPEN_METEO_BASE}/forecast",
+        params={
+            "latitude": geo["latitude"],
+            "longitude": geo["longitude"],
+            "hourly": ",".join([
+                "temperature_2m",
+                "precipitation_probability",
+                "precipitation",
+                "weather_code",
+                "wind_speed_10m",
+            ]),
+            "forecast_hours": hours,
+            "timezone": geo["timezone"] or "auto",
+            "temperature_unit": "fahrenheit",
+            "wind_speed_unit": "mph",
+            "precipitation_unit": "inch",
+        },
+        timeout=DEFAULT_TIMEOUT,
+    )
+    resp.raise_for_status()
+    hourly = resp.json().get("hourly", {})
+    times = hourly.get("time", [])
+    periods = []
+    for i, t in enumerate(times):
+        periods.append({
+            "time": t,
+            "temperature_f": hourly.get("temperature_2m", [None])[i],
+            "precipitation_chance_pct": hourly.get("precipitation_probability", [None])[i],
+            "precipitation_in": hourly.get("precipitation", [None])[i],
+            "wind_mph": hourly.get("wind_speed_10m", [None])[i],
+            "conditions": _weather_code_to_text(hourly.get("weather_code", [None])[i]),
+        })
+    return {
+        "location": _short_name(geo),
+        "latitude": geo["latitude"],
+        "longitude": geo["longitude"],
+        "hours": periods,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Active alerts (NWS, US-only)
+# ---------------------------------------------------------------------------
+
+def get_active_alerts(location: str) -> dict[str, Any]:
+    """Active NWS alerts for a US location. Returns empty list for non-US."""
+    geo = geocode(location)
+    session = _get_nws_session()
     try:
-        lakebase.run_write(
-            """
-            CREATE TABLE IF NOT EXISTS mcp_tool_traces (
-                id SERIAL PRIMARY KEY,
-                session_id VARCHAR(36) NOT NULL,
-                tool_name VARCHAR(100) NOT NULL,
-                user_email VARCHAR(255) NOT NULL,
-                parameters JSONB,
-                result JSONB,
-                duration_ms NUMERIC(10, 2),
-                success BOOLEAN NOT NULL,
-                error_message TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-            """,
-            (),
+        resp = session.get(
+            f"{NWS_BASE}/alerts/active",
+            params={"point": f"{geo['latitude']},{geo['longitude']}"},
+            timeout=DEFAULT_TIMEOUT,
         )
-    except Exception as e:
-        # Common cases: "must be owner of table" if it already exists but
-        # was created by a different role. We proceed and rely on INSERTs
-        # succeeding (they only need INSERT privilege, not ownership).
-        logger.warning(f"Could not ensure mcp_tool_traces table (may already exist): {e}")
-
-
-def _log_tool_call_to_lakebase(
-    tool_name: str,
-    parameters: dict,
-    result: dict,
-    duration_ms: float,
-    success: bool,
-    error_message: str = None,
-):
-    """Log an MCP tool call to Lakebase for monitoring/analytics."""
-    try:
-        _ensure_traces_table()
-        user_email = _get_end_user_email()
-        lakebase.run_write(
-            """
-            INSERT INTO mcp_tool_traces
-                (session_id, tool_name, user_email, parameters, result, duration_ms, success, error_message)
-            VALUES
-                (%s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                SESSION_ID,
-                tool_name,
-                user_email,
-                json.dumps(parameters, default=str),
-                json.dumps(result, default=str) if result else None,
-                duration_ms,
-                success,
-                error_message,
-            ),
-        )
-    except Exception as e:
-        logger.warning(f"Failed to log tool trace for {tool_name}: {e}")
-
-
-def traced_tool(func):
-    """
-    Decorator that wraps MCP tools to add automatic tracing to Lakebase.
-    Captures tool name, input params, return value, duration, success, user.
-    """
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        start_time = time.time()
-        tool_name = func.__name__
-
-        sig = inspect.signature(func)
-        bound_args = sig.bind(*args, **kwargs)
-        bound_args.apply_defaults()
-        parameters = dict(bound_args.arguments)
-
-        result = None
-        success = True
-        error_message = None
-
-        try:
-            result = func(*args, **kwargs)
-            return result
-        except Exception as e:
-            success = False
-            error_message = str(e)
-            result = {"status": "error", "message": str(e)}
-            raise
-        finally:
-            duration_ms = (time.time() - start_time) * 1000
-            try:
-                _log_tool_call_to_lakebase(
-                    tool_name=tool_name,
-                    parameters=parameters,
-                    result=result,
-                    duration_ms=duration_ms,
-                    success=success,
-                    error_message=error_message,
-                )
-            except Exception:
-                pass
-
-    return wrapper
-
-
-# ---------------------------------------------------------------------------
-# FastMCP setup
-# ---------------------------------------------------------------------------
-
-mcp = FastMCP("weather")
-
-
-class RequestContextMiddleware(BaseHTTPMiddleware):
-    """Capture HTTP headers containing end-user identity into a ContextVar."""
-    async def dispatch(self, request: Request, call_next):
-        headers = {
-            'x-forwarded-user': request.headers.get('x-forwarded-user'),
-            'x-forwarded-email': request.headers.get('x-forwarded-email'),
-        }
-        _request_context.set(headers)
-        response = await call_next(request)
-        return response
-
-
-# ---------------------------------------------------------------------------
-# Tools
-# ---------------------------------------------------------------------------
-
-@mcp.tool
-@traced_tool
-def resolve_location(query: str) -> dict:
-    """
-    Resolve a human-readable location name to latitude/longitude via Open-Meteo.
-
-    Use this when the user names a place and you need coordinates or need
-    to verify it exists. Other weather tools accept location names directly,
-    so you usually don't need to call this first - it's useful for
-    disambiguation or when the user asks 'where is X?'.
-
-    Args:
-        query: A place name, e.g. "Chicago", "Paris", "Kauai", "10001".
-
-    Returns:
-        A dict with status ("success" or "error"), and on success the
-        resolved name, country, state/admin1, latitude, longitude, timezone.
-    """
-    try:
-        result = weather_broker.geocode(query)
-        return {"status": "success", **result}
-    except Exception as e:
-        logger.exception(f"resolve_location failed for {query!r}")
-        return {"status": "error", "message": f"Failed to resolve location: {str(e)}"}
-
-
-@mcp.tool
-@traced_tool
-def get_current_weather(location: str) -> dict:
-    """
-    Get the current weather conditions at a location (Open-Meteo).
-
-    Use this when the user asks about the weather RIGHT NOW - not later
-    today or tomorrow. Returns temperature (F), feels-like temperature,
-    humidity, precipitation, wind, cloud cover, and text conditions.
-
-    Args:
-        location: A place name, e.g. "Austin, TX" or "Tokyo".
-
-    Returns:
-        A dict with status, and on success: observed_at, temperature_f,
-        feels_like_f, humidity_pct, precipitation_in, wind_mph,
-        wind_direction_deg, cloud_cover_pct, conditions text.
-    """
-    try:
-        result = weather_broker.get_current(location)
-        return {"status": "success", **result}
-    except Exception as e:
-        logger.exception(f"get_current_weather failed for {location!r}")
-        return {"status": "error", "message": f"Failed to fetch weather: {str(e)}"}
-
-
-@mcp.tool
-@traced_tool
-def get_daily_forecast(location: str, days: int = 3) -> dict:
-    """
-    Get a daily weather forecast for a location for the next N days (1-7).
-
-    Use this when the user asks about multi-day weather - 'this weekend',
-    'next week', 'tomorrow through Friday'. Returns one entry per day with
-    high/low temps, precipitation chance, max wind, sunrise/sunset, and
-    conditions text.
-
-    Args:
-        location: A place name, e.g. "Chicago, IL".
-        days: Number of days to forecast, from 1 to 7 (default 3).
-
-    Returns:
-        A dict with status, and on success a 'days' list with date, high_f,
-        low_f, precipitation_chance_pct, precipitation_in, max_wind_mph,
-        conditions, sunrise, sunset per day.
-    """
-    try:
-        result = weather_broker.get_daily_forecast(location, days)
-        return {"status": "success", **result}
-    except Exception as e:
-        logger.exception(f"get_daily_forecast failed for {location!r}")
-        return {"status": "error", "message": f"Failed to fetch forecast: {str(e)}"}
-
-
-@mcp.tool
-@traced_tool
-def get_hourly_forecast(location: str, hours: int = 24) -> dict:
-    """
-    Get an hourly weather forecast for a location for the next N hours (1-72).
-
-    Use this when the user asks about specific times within a day -
-    'will it rain this afternoon?', 'is it clear tonight?', 'when should
-    I go running?'. Returns one entry per hour.
-
-    Args:
-        location: A place name, e.g. "Seattle".
-        hours: Number of hours to forecast, from 1 to 72 (default 24).
-
-    Returns:
-        A dict with status, and on success an 'hours' list with time,
-        temperature_f, precipitation_chance_pct, precipitation_in,
-        wind_mph, and conditions per hour.
-    """
-    try:
-        result = weather_broker.get_hourly_forecast(location, hours)
-        return {"status": "success", **result}
-    except Exception as e:
-        logger.exception(f"get_hourly_forecast failed for {location!r}")
-        return {"status": "error", "message": f"Failed to fetch hourly forecast: {str(e)}"}
-
-
-@mcp.tool
-@traced_tool
-def get_active_alerts(location: str) -> dict:
-    """
-    Get active National Weather Service alerts for a US location.
-
-    Use this when the user asks about severe weather warnings - 'is there
-    a flood warning?', 'any tornado watches?', 'is it safe to travel?'.
-    Returns flash flood warnings, tornado watches, winter storm warnings,
-    heat advisories, etc.
-
-    Note: NWS covers US locations only. For non-US locations, returns an
-    empty alerts list with a note.
-
-    Args:
-        location: A place name, e.g. "Miami, FL".
-
-    Returns:
-        A dict with status, and on success an 'alerts' list with event,
-        headline, severity, urgency, certainty, sent, expires, description,
-        and safety instruction per alert.
-    """
-    try:
-        result = weather_broker.get_active_alerts(location)
-        return {"status": "success", **result}
-    except Exception as e:
-        logger.exception(f"get_active_alerts failed for {location!r}")
-        return {"status": "error", "message": f"Failed to fetch alerts: {str(e)}"}
-
-
-@mcp.tool
-@traced_tool
-def vector_search(query: str, limit: int = 5) -> dict:
-    """
-    Semantic search over stored weather documents (alerts + forecasts) using
-    pgvector cosine similarity.
-
-    Use this when the user asks about weather patterns, historical alerts,
-    or concepts rather than a specific live forecast - e.g. 'any flooding
-    concerns near rivers?', 'reports of heavy snowfall lately?', 'what
-    severe weather has been active?'.
-
-    This is DIFFERENT from get_active_alerts (which fetches live NWS
-    alerts for one point right now). This searches the internal document
-    store populated by prior /weather/sync runs from the Day 2 Flask app,
-    so it can find semantically-related content across many locations and
-    time periods.
-
-    Args:
-        query: A natural-language search query.
-        limit: Maximum results to return, from 1 to 20 (default 5).
-
-    Returns:
-        A dict with status, and on success: query, model, and a 'results'
-        list with location, headline, source_type, chunk_text, issued_at,
-        similarity score per row.
-    """
-    if not query or not query.strip():
-        return {"status": "error", "message": "Query text is required"}
-
-    limit = max(1, min(20, int(limit)))
-
-    try:
-        model = get_embedding_model()
-        query_vec = model.encode(query).tolist()
-        query_vec_str = "[" + ",".join(str(x) for x in query_vec) + "]"
-
-        results = lakebase.run_query(
-            f"""
-            SELECT d.id,
-                   d.location,
-                   d.source_type,
-                   d.headline,
-                   e.chunk_text,
-                   d.issued_at,
-                   1 - (e.embedding <=> %s::vector) AS similarity
-            FROM {WEATHER_EMBEDDINGS_TABLE} e
-            JOIN {WEATHER_DOCS_TABLE} d ON d.id = e.document_id
-            ORDER BY e.embedding <=> %s::vector
-            LIMIT %s
-            """,
-            (query_vec_str, query_vec_str, limit),
-        )
-
+        resp.raise_for_status()
+    except requests.RequestException:
         return {
-            "status": "success",
-            "query": query,
-            "model": EMBEDDING_MODEL,
-            "results": results,
+            "location": _short_name(geo),
+            "alerts": [],
+            "note": "No alerts available (NWS covers US locations only).",
         }
 
-    except Exception as e:
-        logger.exception("Vector search failed")
-        return {"status": "error", "message": f"Vector search failed: {str(e)}"}
-
-
-@mcp.tool
-@traced_tool
-def get_current_user() -> dict:
-    """
-    Get information about the currently authenticated end user accessing
-    the MCP server.
-
-    When running as a Databricks App, returns the actual end user making
-    the request (from X-Forwarded-User header), not the service principal
-    running the app.
-
-    Returns:
-        A dict with status, and on success: user_name (email), and source
-        ("request_header" or "service_principal").
-    """
-    try:
-        headers = _request_context.get()
-        forwarded_user = headers.get('x-forwarded-user')
-        forwarded_email = headers.get('x-forwarded-email')
-
-        if forwarded_user:
-            return {
-                "status": "success",
-                "user_name": forwarded_user,
-                "forwarded_email": forwarded_email,
-                "source": "request_header",
-            }
-
-        from databricks.sdk import WorkspaceClient
-        w = WorkspaceClient()
-        user = w.current_user.me()
-        return {
-            "status": "success",
-            "user_name": user.user_name,
-            "display_name": user.display_name,
-            "active": user.active,
-            "source": "service_principal",
-        }
-    except Exception as e:
-        logger.exception("Failed to get current user")
-        return {"status": "error", "message": f"Failed to get current user: {str(e)}"}
+    features = resp.json().get("features", []) or []
+    alerts = []
+    for feature in features:
+        props = feature.get("properties", {})
+        alerts.append({
+            "event": props.get("event"),
+            "headline": props.get("headline"),
+            "severity": props.get("severity"),
+            "urgency": props.get("urgency"),
+            "certainty": props.get("certainty"),
+            "sent": props.get("sent"),
+            "expires": props.get("expires"),
+            "description": (props.get("description") or "")[:800],
+            "instruction": props.get("instruction"),
+        })
+    return {
+        "location": _short_name(geo),
+        "alerts": alerts,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Run
+# WMO weather code -> text
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    # Add middleware to capture request headers for end-user identity.
-    if hasattr(mcp, 'app') and mcp.app is not None:
-        mcp.app.add_middleware(RequestContextMiddleware)
+_WEATHER_CODES = {
+    0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+    45: "Fog", 48: "Depositing rime fog",
+    51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
+    56: "Light freezing drizzle", 57: "Dense freezing drizzle",
+    61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain",
+    66: "Light freezing rain", 67: "Heavy freezing rain",
+    71: "Slight snow fall", 73: "Moderate snow fall", 75: "Heavy snow fall",
+    77: "Snow grains",
+    80: "Slight rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
+    85: "Slight snow showers", 86: "Heavy snow showers",
+    95: "Thunderstorm", 96: "Thunderstorm with slight hail", 99: "Thunderstorm with heavy hail",
+}
 
-    port = int(os.getenv("DATABRICKS_APP_PORT", os.getenv("PORT", 8000)))
-    mcp.run(transport="http", host="0.0.0.0", port=port)
+
+def _weather_code_to_text(code: int | None) -> str | None:
+    if code is None:
+        return None
+    return _WEATHER_CODES.get(int(code), f"Unknown ({code})")
+
+
+# ---------------------------------------------------------------------------
+# Recommendation logic - derived judgments over raw forecast data
+# ---------------------------------------------------------------------------
+
+def get_recommendation(location: str, date_offset: int = 0) -> dict[str, Any]:
+    """Derive practical recommendations for a date from the forecast data.
+
+    date_offset: 0 = today, 1 = tomorrow, 2 = day after, up to 6.
+
+    Returns a set of yes/no recommendations plus a reasoning string for each,
+    so the agent can answer questions like 'bring an umbrella?', 'jacket?',
+    'is it a good day for a run?' without having to reason over raw
+    Open-Meteo output.
+    """
+    date_offset = max(0, min(6, int(date_offset)))
+    forecast = get_daily_forecast(location, days=date_offset + 1)
+    day = forecast["days"][date_offset]
+
+    high_f = day.get("high_f")
+    low_f = day.get("low_f")
+    precip_chance = day.get("precipitation_chance_pct") or 0
+    precip_amount = day.get("precipitation_in") or 0
+    wind = day.get("max_wind_mph") or 0
+    conditions = (day.get("conditions") or "").lower()
+
+    # --- Umbrella / rain gear ---
+    if precip_chance >= 70 or precip_amount >= 0.25:
+        umbrella = {
+            "needed": True,
+            "reasoning": f"{precip_chance}% chance of precipitation with expected {precip_amount} in. Bring an umbrella or rain jacket.",
+        }
+    elif precip_chance >= 40:
+        umbrella = {
+            "needed": True,
+            "reasoning": f"{precip_chance}% chance of precipitation - a compact umbrella is a good precaution.",
+        }
+    else:
+        umbrella = {
+            "needed": False,
+            "reasoning": f"Only {precip_chance}% chance of precipitation. Umbrella not needed.",
+        }
+
+    # --- Jacket / layers ---
+    if low_f is not None and low_f < 40:
+        jacket = {
+            "needed": True,
+            "reasoning": f"Low of {low_f}F - a warm jacket is needed, especially in the morning/evening.",
+        }
+    elif low_f is not None and low_f < 55:
+        jacket = {
+            "needed": True,
+            "reasoning": f"Low of {low_f}F - a light jacket or layers recommended.",
+        }
+    else:
+        jacket = {
+            "needed": False,
+            "reasoning": f"Low of {low_f}F is mild enough to skip the jacket.",
+        }
+
+    # --- Sunscreen ---
+    if any(word in conditions for word in ["clear", "sunny", "mainly clear"]) and high_f and high_f >= 65:
+        sunscreen = {
+            "needed": True,
+            "reasoning": f"Clear/sunny conditions with high of {high_f}F. UV exposure likely - wear sunscreen.",
+        }
+    else:
+        sunscreen = {
+            "needed": False,
+            "reasoning": f"Conditions are {day.get('conditions')} - lower UV risk.",
+        }
+
+    # --- Outdoor activities (running, cycling, picnic) ---
+    outdoor_safe = True
+    outdoor_reasons = []
+    if precip_chance >= 50:
+        outdoor_safe = False
+        outdoor_reasons.append(f"{precip_chance}% chance of rain")
+    if wind >= 25:
+        outdoor_safe = False
+        outdoor_reasons.append(f"windy ({wind} mph)")
+    if high_f is not None and high_f >= 95:
+        outdoor_safe = False
+        outdoor_reasons.append(f"very hot ({high_f}F) - heat risk")
+    if low_f is not None and low_f <= 32:
+        outdoor_safe = False
+        outdoor_reasons.append(f"freezing ({low_f}F)")
+    if any(word in conditions for word in ["thunderstorm", "heavy rain", "heavy snow"]):
+        outdoor_safe = False
+        outdoor_reasons.append(f"severe weather ({day.get('conditions')})")
+
+    outdoor = {
+        "recommended": outdoor_safe,
+        "reasoning": (
+            f"Good day for outdoor activities. High {high_f}F, low {low_f}F, "
+            f"{precip_chance}% chance of rain, winds up to {wind} mph."
+            if outdoor_safe
+            else f"Not ideal for outdoor activities: {', '.join(outdoor_reasons)}."
+        ),
+    }
+
+    # --- Travel / driving conditions ---
+    travel_safe = True
+    travel_reasons = []
+    if precip_amount >= 0.5:
+        travel_safe = False
+        travel_reasons.append(f"heavy precipitation expected ({precip_amount} in)")
+    if wind >= 35:
+        travel_safe = False
+        travel_reasons.append(f"strong winds ({wind} mph)")
+    if any(word in conditions for word in ["heavy snow", "freezing", "thunderstorm", "violent"]):
+        travel_safe = False
+        travel_reasons.append(f"hazardous conditions ({day.get('conditions')})")
+
+    travel = {
+        "safe": travel_safe,
+        "reasoning": (
+            f"Travel conditions look normal. {day.get('conditions')}, winds up to {wind} mph."
+            if travel_safe
+            else f"Exercise caution when traveling: {', '.join(travel_reasons)}."
+        ),
+    }
+
+    return {
+        "location": day.get("date") and forecast["location"],
+        "date": day.get("date"),
+        "forecast_summary": {
+            "high_f": high_f,
+            "low_f": low_f,
+            "conditions": day.get("conditions"),
+            "precipitation_chance_pct": precip_chance,
+            "precipitation_in": precip_amount,
+            "max_wind_mph": wind,
+        },
+        "recommendations": {
+            "umbrella": umbrella,
+            "jacket": jacket,
+            "sunscreen": sunscreen,
+            "outdoor_activities": outdoor,
+            "travel": travel,
+        },
+    }
