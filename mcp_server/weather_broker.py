@@ -311,3 +311,146 @@ def _weather_code_to_text(code: int | None) -> str | None:
     if code is None:
         return None
     return _WEATHER_CODES.get(int(code), f"Unknown ({code})")
+
+
+# ---------------------------------------------------------------------------
+# Recommendation logic - derived judgments over raw forecast data
+# ---------------------------------------------------------------------------
+
+def get_recommendation(location: str, date_offset: int = 0) -> dict[str, Any]:
+    """Derive practical recommendations for a date from the forecast data.
+
+    date_offset: 0 = today, 1 = tomorrow, 2 = day after, up to 6.
+
+    Returns a set of yes/no recommendations plus a reasoning string for each,
+    so the agent can answer questions like 'bring an umbrella?', 'jacket?',
+    'is it a good day for a run?' without having to reason over raw
+    Open-Meteo output.
+    """
+    date_offset = max(0, min(6, int(date_offset)))
+    forecast = get_daily_forecast(location, days=date_offset + 1)
+    day = forecast["days"][date_offset]
+
+    high_f = day.get("high_f")
+    low_f = day.get("low_f")
+    precip_chance = day.get("precipitation_chance_pct") or 0
+    precip_amount = day.get("precipitation_in") or 0
+    wind = day.get("max_wind_mph") or 0
+    conditions = (day.get("conditions") or "").lower()
+
+    # --- Umbrella / rain gear ---
+    if precip_chance >= 70 or precip_amount >= 0.25:
+        umbrella = {
+            "needed": True,
+            "reasoning": f"{precip_chance}% chance of precipitation with expected {precip_amount} in. Bring an umbrella or rain jacket.",
+        }
+    elif precip_chance >= 40:
+        umbrella = {
+            "needed": True,
+            "reasoning": f"{precip_chance}% chance of precipitation - a compact umbrella is a good precaution.",
+        }
+    else:
+        umbrella = {
+            "needed": False,
+            "reasoning": f"Only {precip_chance}% chance of precipitation. Umbrella not needed.",
+        }
+
+    # --- Jacket / layers ---
+    if low_f is not None and low_f < 40:
+        jacket = {
+            "needed": True,
+            "reasoning": f"Low of {low_f}F - a warm jacket is needed, especially in the morning/evening.",
+        }
+    elif low_f is not None and low_f < 55:
+        jacket = {
+            "needed": True,
+            "reasoning": f"Low of {low_f}F - a light jacket or layers recommended.",
+        }
+    else:
+        jacket = {
+            "needed": False,
+            "reasoning": f"Low of {low_f}F is mild enough to skip the jacket.",
+        }
+
+    # --- Sunscreen ---
+    if any(word in conditions for word in ["clear", "sunny", "mainly clear"]) and high_f and high_f >= 65:
+        sunscreen = {
+            "needed": True,
+            "reasoning": f"Clear/sunny conditions with high of {high_f}F. UV exposure likely - wear sunscreen.",
+        }
+    else:
+        sunscreen = {
+            "needed": False,
+            "reasoning": f"Conditions are {day.get('conditions')} - lower UV risk.",
+        }
+
+    # --- Outdoor activities (running, cycling, picnic) ---
+    outdoor_safe = True
+    outdoor_reasons = []
+    if precip_chance >= 50:
+        outdoor_safe = False
+        outdoor_reasons.append(f"{precip_chance}% chance of rain")
+    if wind >= 25:
+        outdoor_safe = False
+        outdoor_reasons.append(f"windy ({wind} mph)")
+    if high_f is not None and high_f >= 95:
+        outdoor_safe = False
+        outdoor_reasons.append(f"very hot ({high_f}F) - heat risk")
+    if low_f is not None and low_f <= 32:
+        outdoor_safe = False
+        outdoor_reasons.append(f"freezing ({low_f}F)")
+    if any(word in conditions for word in ["thunderstorm", "heavy rain", "heavy snow"]):
+        outdoor_safe = False
+        outdoor_reasons.append(f"severe weather ({day.get('conditions')})")
+
+    outdoor = {
+        "recommended": outdoor_safe,
+        "reasoning": (
+            f"Good day for outdoor activities. High {high_f}F, low {low_f}F, "
+            f"{precip_chance}% chance of rain, winds up to {wind} mph."
+            if outdoor_safe
+            else f"Not ideal for outdoor activities: {', '.join(outdoor_reasons)}."
+        ),
+    }
+
+    # --- Travel / driving conditions ---
+    travel_safe = True
+    travel_reasons = []
+    if precip_amount >= 0.5:
+        travel_safe = False
+        travel_reasons.append(f"heavy precipitation expected ({precip_amount} in)")
+    if wind >= 35:
+        travel_safe = False
+        travel_reasons.append(f"strong winds ({wind} mph)")
+    if any(word in conditions for word in ["heavy snow", "freezing", "thunderstorm", "violent"]):
+        travel_safe = False
+        travel_reasons.append(f"hazardous conditions ({day.get('conditions')})")
+
+    travel = {
+        "safe": travel_safe,
+        "reasoning": (
+            f"Travel conditions look normal. {day.get('conditions')}, winds up to {wind} mph."
+            if travel_safe
+            else f"Exercise caution when traveling: {', '.join(travel_reasons)}."
+        ),
+    }
+
+    return {
+        "location": day.get("date") and forecast["location"],
+        "date": day.get("date"),
+        "forecast_summary": {
+            "high_f": high_f,
+            "low_f": low_f,
+            "conditions": day.get("conditions"),
+            "precipitation_chance_pct": precip_chance,
+            "precipitation_in": precip_amount,
+            "max_wind_mph": wind,
+        },
+        "recommendations": {
+            "umbrella": umbrella,
+            "jacket": jacket,
+            "sunscreen": sunscreen,
+            "outdoor_activities": outdoor,
+            "travel": travel,
+        },
+    }
