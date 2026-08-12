@@ -1,182 +1,228 @@
-# Databricks-lakebase-weather-mcp
-MCP server that exposes weather-forecast tools, and wire a Databricks Agent Bricks agent to use it to answer weather questions and make simple predictions/recommendations
+# Weather Intelligence
 
-# Weather MCP Server
+An end-to-end AI-powered weather system on Databricks:
 
-FastMCP server that exposes weather forecast tools to Databricks Agent Bricks
-(or any other MCP client) over HTTP. Reuses the Day 2 `weather_embeddings`
-pgvector table so the agent can do both **live-forecast lookups** and
-**semantic search over stored alerts** in the same conversation.
+- **Day 2** — retrieval-augmented (RAG) semantic search over unstructured weather narratives from the National Weather Service
+- **Day 3** — a FastMCP server exposing live forecast tools + the Day 2 RAG data, wired to a Databricks Agent Bricks agent
 
-Follows the same architectural pattern as the Day 3 Alpaca MCP reference:
-thin server (@mcp.tool decorators), fat broker (all HTTP + parsing logic).
+Ask *"flash flood risk this weekend?"* or *"should I bring an umbrella to Chicago tomorrow?"* and the agent chooses the right tool (live forecast vs. historical alert search vs. derived recommendation), calls it, and answers in natural language.
 
-## Tools
+---
 
-Eight tools total, grouped by purpose:
+## Update — Agent configuration documentation added
 
-**Live forecast (Open-Meteo, no auth)**
-| Tool | When Agent Bricks calls it |
-|---|---|
-| `resolve_location(query)` | User names a place; disambiguation needed |
-| `get_current_weather(location)` | "What's the weather right now?" |
-| `get_daily_forecast(location, days)` | "Weather this weekend?" |
-| `get_hourly_forecast(location, hours)` | "Will it rain this afternoon?" |
+Following initial grading feedback, the `agent/` folder now contains the
+verbatim system prompt configured in Agent Bricks, along with screenshots
+verifying agent behavior against each guardrail (rubric items 4.2, 4.3, 4.4).
 
-**Severe weather (NWS, US-only, no auth)**
-| Tool | When Agent Bricks calls it |
-|---|---|
-| `get_active_alerts(location)` | "Any flood warnings? Severe weather?" |
+---
 
-**Derived reasoning**
-| Tool | When Agent Bricks calls it |
-|---|---|
-| `get_recommendation(location, date_offset)` | "Should I bring an umbrella? Jacket? Good day to run?" |
+## What this project does
 
-**Semantic search over stored data**
-| Tool | When Agent Bricks calls it |
-|---|---|
-| `vector_search(query, limit)` | "Have there been any recent flood alerts?" |
+Traditional keyword search can't tell that *"heavy rainfall causing rapid rises on creeks"* is relevant to a query about *"flood risk near rivers."* This project solves that by embedding weather narratives into vector space, then finding matches by cosine similarity. Then it layers an MCP server + AI agent on top so a chat agent can autonomously combine live-forecast tools with semantic historical search.
 
-**Identity**
-| Tool | When Agent Bricks calls it |
-|---|---|
-| `get_current_user()` | Personalization / auth check |
+End-to-end, the pipeline:
 
-Each tool has a detailed docstring — Agent Bricks reads these to decide when
-to call each one. Docstrings are the most important part of an MCP server.
+1. **Harvests** unstructured alerts and forecasts from the National Weather Service
+2. **Chunks and embeds** the narrative text using `sentence-transformers/all-MiniLM-L6-v2` (384-dim)
+3. **Stores** the vectors in Lakebase (Postgres + pgvector) with an HNSW cosine-similarity index
+4. **Serves** a Flask REST API (Day 2) and an MCP server (Day 3) that share the same data
+5. **Powers** an Agent Bricks agent that reasons over both live forecasts and historical alerts
 
-## Files
+---
 
-- `weather_mcp_server.py` — FastMCP server, all `@mcp.tool` decorators
-- `weather_broker.py` — HTTP calls to Open-Meteo + NWS, plus recommendation reasoning
-- `lakebase.py` — Postgres connection helper (uses `database/lakebase-url` secret)
-- `app.yaml` — Databricks App deployment config
-- `requirements.txt` — dependencies
-- `setup_secrets.py` — one-time secret setup (only run if Lakebase secret doesn't exist yet)
-- `README.md` — this file
+## Tech stack
 
-## Data sources
+- **Backend** — Python, Flask, FastMCP
+- **Database** — PostgreSQL (Databricks Lakebase) with pgvector extension
+- **Embeddings** — `sentence-transformers/all-MiniLM-L6-v2` (384-dim)
+- **Live data** — Open-Meteo API (global forecasts) + National Weather Service API (US alerts)
+- **Platform** — Databricks Apps (both Flask and MCP server deployed as separate apps)
+- **AI** — Databricks Agent Bricks with external MCP tool
 
-All free, no API key required:
+---
 
-- **Open-Meteo** ([open-meteo.com](https://open-meteo.com/)) — geocoding + current, hourly, daily forecasts. Global coverage. ~10,000 calls/day for non-commercial use.
-- **NWS** ([weather.gov](https://api.weather.gov/)) — active weather alerts. US only. Requires a descriptive `User-Agent` header (set via env var in `app.yaml`).
-- **Lakebase (Day 2 `weather_embeddings`)** — semantic search over previously-synced NWS documents. Populated by the Day 2 sync + ingest pipeline.
-
-## Recommendation reasoning
-
-The `get_recommendation` tool encodes practical judgment rules in Python
-rather than relying on the LLM to reason over raw numbers. Current rules:
-
-- **Umbrella:** rain chance ≥ 70% or precip ≥ 0.25 in → yes (urgent). 40–70% → yes (precaution).
-- **Jacket:** low < 40°F → warm jacket. 40–55°F → light jacket.
-- **Sunscreen:** clear conditions + high ≥ 65°F → yes.
-- **Outdoor activities:** unsafe if rain chance ≥ 50%, wind ≥ 25 mph, high ≥ 95°F, low ≤ 32°F, or severe weather.
-- **Travel:** caution if precip ≥ 0.5 in, wind ≥ 35 mph, or hazardous conditions.
-
-Each recommendation returns a boolean and a reasoning string the agent
-can quote directly to the user.
-
-## Running locally
-
-```bash
-pip install -r requirements.txt
-python weather_mcp_server.py
-```
-
-Server listens on `http://0.0.0.0:8000` by default (honors `DATABRICKS_APP_PORT`
-and `PORT` env vars).
-
-## Deploying to Databricks
-
-1. Push this `mcp_server/` folder to your Git repo
-2. Sync into a Databricks workspace Git folder
-3. Create a new Databricks App pointing at `mcp_server/`
-4. Databricks reads `app.yaml`, injects the Lakebase secret, starts the server
-5. Note the app URL — that's what the Agent Bricks agent will point at
-
-First deploy takes ~2 minutes (pip installs `sentence-transformers` + downloads
-the embedding model, ~200MB).
-
-## Wiring up Agent Bricks
-
-1. In Databricks, open **Agent Bricks** → **Create new agent**
-2. Name: `Weather Assistant`
-3. Add an **external MCP tool** — paste the deployed MCP server URL
-4. Write the system prompt:
+## Repo structure
 
 ```
-You are a helpful weather assistant with access to live weather data and a
-searchable history of past weather alerts.
-
-Available tools and when to use each:
-- get_current_weather: When the user asks about weather RIGHT NOW.
-- get_daily_forecast: For multi-day questions ("this weekend", "next week").
-- get_hourly_forecast: For specific times within a day ("this afternoon", "tonight").
-- get_active_alerts: For severe weather questions ("flood warning?", "any alerts?"). US only.
-- get_recommendation: For advice questions ("should I bring an umbrella?", "do I need a jacket?", "safe to travel?"). Prefer this over reasoning over raw forecasts yourself.
-- vector_search: For "have there been any X lately?" questions - searches stored NWS alerts semantically.
-- resolve_location: Only if you need to disambiguate a location.
-
-When answering, quote the specific numbers and reasoning strings from the tool
-responses. Always name the location you're reporting on. If a location isn't
-in the US, mention that severe weather alerts may not be available.
+.
+├── README.md                           # this file
+├── .gitignore
+├── .env.example
+├── requirements.txt
+├── setup_secrets.py
+├── databricks.yml
+│
+├── app.py                              # Day 2: Flask app (/weather/sync, /weather/search)
+├── app.yaml                            # Day 2: Databricks App config
+├── lakebase.py                         # Postgres connection helper
+├── weather_client.py                   # NWS API client
+├── templates/
+│   └── index.html                      # Day 2: search UI
+├── sql/
+│   ├── 01_setup_weather_documents_table.sql
+│   ├── 02_setup_weather_embeddings_table.sql
+│   └── README.md
+├── notebooks/
+│   └── ingest_weather_embeddings.py    # Day 2: batch embedding job
+├── resources/
+│   └── ingest_weather_embeddings_job.yml
+│
+├── mcp_server/                         # Day 3: FastMCP server + broker
+│   ├── weather_mcp_server.py           # 8 tools with auto-tracing
+│   ├── weather_broker.py               # Open-Meteo + NWS + recommendation logic
+│   ├── lakebase.py                     # Postgres helper (lazy WorkspaceClient)
+│   ├── app.yaml                        # Databricks App config
+│   ├── requirements.txt
+│   ├── setup_secrets.py
+│   └── README.md
+│
+├── agent/                              # Day 3: Agent Bricks configuration
+│   ├── README.md                       # Full agent docs + rubric mapping
+│   ├── system_prompt.md                # Verbatim configured system prompt
+│   └── screenshots/                    # Config + test conversation screenshots
+│
+└── docs/
+    └── DEPLOYMENT_ISSUES.md            # 5 real issues + fixes from deployment
 ```
 
-5. Save and test in the playground:
-   - *"Will it rain in Chicago tomorrow?"*
-   - *"Should I bring a jacket to Austin this weekend?"*
-   - *"Is there a flood warning near Miami right now?"*
-   - *"Have there been any recent severe weather alerts about creeks?"* ← uses `vector_search`
-   - *"What should I know about the weather in Kauai on December 22nd?"* ← uses `get_recommendation`
+---
+
+## Day 2 — Weather RAG Pipeline
+
+A Flask app that ingests NWS narratives, embeds them, and serves semantic search over them.
+
+**Endpoints:**
+- `POST /weather/sync` — fetch alerts + forecasts from NWS for a list of locations, upsert into `weather_documents`
+- `POST /weather/search` — cosine similarity search over `weather_embeddings`, returns top-K ranked chunks
+
+**Tables in Lakebase:**
+- `weather_documents` — raw NWS documents (one row per alert or forecast period)
+- `weather_embeddings` — chunked narrative embeddings (VECTOR(384), HNSW indexed for cosine distance)
+
+Full setup and run instructions: see `mcp_server/../` deployment steps and `sql/README.md`.
+
+---
+
+## Day 3 — MCP Server + Agent Bricks
+
+A FastMCP server exposing 8 tools to a Databricks Agent Bricks agent. Reuses the Day 2 `weather_embeddings` table as one of its tools (`vector_search`), and adds live-forecast tools from Open-Meteo + severe weather alerts from NWS.
+
+**Tools exposed (8 total):**
+
+| Tool | Data source | When Agent Bricks calls it |
+|---|---|---|
+| `resolve_location(query)` | Open-Meteo | Location disambiguation |
+| `get_current_weather(location)` | Open-Meteo | "Right now" questions |
+| `get_daily_forecast(location, days)` | Open-Meteo | Multi-day questions |
+| `get_hourly_forecast(location, hours)` | Open-Meteo | Within-day questions |
+| `get_active_alerts(location)` | NWS (US-only) | Severe weather questions |
+| `get_recommendation(location, date_offset)` | Derived logic | Advice questions (umbrella, jacket, travel) |
+| `vector_search(query, limit)` | Lakebase pgvector | "Have there been any X lately?" (historical) |
+| `get_current_user()` | Request context | Identity/personalization |
+
+**Deployed as its own Databricks App**, separate from the Day 2 Flask app. Agent Bricks connects to it as an external MCP tool.
+
+Full details: `mcp_server/README.md`.
+
+---
+
+## Agent Bricks Configuration
+
+The `agent/` folder documents the live agent configuration:
+
+- **`agent/system_prompt.md`** — verbatim system prompt currently configured in Agent Bricks
+- **`agent/README.md`** — full agent documentation with rubric mapping
+- **`agent/screenshots/`** — configuration screenshot + test conversations demonstrating each guardrail
+
+The system prompt includes:
+- Explicit tool selection rules for each user intent
+- 6 guardrails (no fabrication, no medical advice, no safety guarantees, location clarification, non-US caveats, tool authority)
+- Response format guidelines
+
+Behavior verification screenshots in `agent/screenshots/` demonstrate:
+- Location clarification (agent asks "which Springfield?" instead of guessing)
+- Non-US caveat (agent notes NWS is US-only for Tokyo queries)
+- No fabrication (agent refuses to invent data for unknown locations)
+
+---
 
 ## Observability
 
-Every tool call is auto-logged to a `mcp_tool_traces_weather` table with
-session ID, user email, parameters, result, duration, and success/failure.
-
-Useful queries:
+Every MCP tool call is auto-logged to `mcp_tool_traces_weather` in Lakebase:
 
 ```sql
--- Tool usage summary for the last day
-SELECT tool_name, count(*) as calls, avg(duration_ms) as avg_ms,
-       sum(case when success then 0 else 1 end) as failures
+SELECT tool_name, count(*) as calls, avg(duration_ms) as avg_ms
 FROM mcp_tool_traces_weather
 WHERE created_at > NOW() - INTERVAL '1 day'
 GROUP BY tool_name
 ORDER BY calls DESC;
-
--- Recent failures
-SELECT created_at, tool_name, user_email, parameters, error_message
-FROM mcp_tool_traces_weather
-WHERE success = false
-ORDER BY created_at DESC
-LIMIT 20;
 ```
 
-If you want to pre-create the trace table to avoid the "must be owner of
-table" error at first tool call:
+Tracked fields: session ID, user email (from `X-Forwarded-User`), parameters, result, duration, success/failure, error message.
 
-```sql
-CREATE TABLE IF NOT EXISTS mcp_tool_traces_weather (
-    id SERIAL PRIMARY KEY,
-    session_id VARCHAR(36) NOT NULL,
-    tool_name VARCHAR(100) NOT NULL,
-    user_email VARCHAR(255) NOT NULL,
-    parameters JSONB,
-    result JSONB,
-    duration_ms NUMERIC(10, 2),
-    success BOOLEAN NOT NULL,
-    error_message TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
-);
+---
+
+## Getting started
+
+### Prerequisites
+
+- A Databricks workspace with Apps enabled
+- A Lakebase (Databricks-managed Postgres) instance with `pgvector` enabled
+- The Lakebase connection URL stored in a Databricks secret at `database/lakebase-url`
+
+### One-time setup
+
+```bash
+# Store the Lakebase URL as a Databricks secret
+python setup_secrets.py
+
+# Create the schema
+psql "$LAKEBASE_URL" -f sql/01_setup_weather_documents_table.sql
+psql "$LAKEBASE_URL" -f sql/02_setup_weather_embeddings_table.sql
 ```
 
-## Known limitations
+### Deploy the Day 2 Flask app
 
-- **NWS is US-only.** International severe-weather alerts would need a different provider.
+1. Push to GitHub, sync to a Databricks git folder
+2. Create a Databricks App pointing at the repo root
+3. App reads `app.yaml`, connects to Lakebase, starts serving `/weather/sync` and `/weather/search`
+
+### Deploy the Day 3 MCP server
+
+1. Same git folder
+2. Create a *second* Databricks App pointing at `mcp_server/` (the subdirectory, not the repo root)
+3. Note the deployed URL
+
+### Wire up Agent Bricks
+
+1. Open Agent Bricks → Create new agent
+2. Add the MCP server URL as an external MCP tool
+3. Paste the system prompt from `agent/system_prompt.md`
+4. Test in the playground
+
+Full instructions: `mcp_server/README.md` and `agent/README.md`.
+
+---
+
+## Deployment lessons learned
+
+`docs/DEPLOYMENT_ISSUES.md` documents 5 real production issues hit during deployment with root causes and fixes:
+
+1. `must be owner of table` error from `CREATE TABLE IF NOT EXISTS` in app code
+2. Same error on the auto-created `mcp_tool_traces_weather` table
+3. App deployed from wrong source (hello-world scaffold instead of actual code)
+4. `OAuth Token not supported for current auth type PAT` from eager `WorkspaceClient()` initialization
+5. Deploying from parent git folder vs. `mcp_server/` subdirectory
+
+Includes a 7-item deployment checklist derived from these fixes.
+
+---
+
+## Known limitations & future work
+
+- **NWS is US-only.** For international severe weather alerts, a different provider would be needed.
 - **`vector_search` requires the Day 2 pipeline to be running.** If `weather_embeddings` is empty, results will be empty.
-- **Recommendation rules are hardcoded.** Encoded as Python thresholds — easy to tune, but no ML judgment.
-- **No caching.** Every tool call hits the upstream API.
-- **Location resolution is basic.** Ambiguous queries always pick the top Open-Meteo geocoding match.
+- **Location resolution is basic.** Ambiguous queries either ask the user or pick the top Open-Meteo geocoding match.
+- **Recommendation rules are hardcoded thresholds.** Easy to tune, but no ML judgment.
+- **No caching.** Every MCP tool call hits the upstream API.
